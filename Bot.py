@@ -25,13 +25,13 @@ CRYPTOBOT_API_KEY = "615167:AAqHnExucpLHPuZsZFG02sdHC8O87hgl319"
 CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 
 # ============ ЮMONEY НАСТРОЙКИ ============
-YOOMONEY_WALLET = "4100119588989551"  # Ваш кошелек ЮMoney
+YOOMONEY_WALLET = "4100119588989551"
 
 # Брендирование
 BOT_NAME = "🔥vlesskeysfreebot🔥"
 KEY_NAME = "🔥TG:vlesskeysfreebot🔥"
 
-# ============ ЦЕНЫ (только 1 устройство) ============
+# ============ ЦЕНЫ ============
 PRICES = {
     "1_day": 5,
     "7_days": 25,
@@ -70,7 +70,6 @@ class OrderState(StatesGroup):
     waiting_for_country = State()
     waiting_for_days = State()
     waiting_for_payment = State()
-    waiting_for_yoomoney = State()
 
 COUNTRIES = [
     {"name": "🇺🇸 США", "code": "us", "city": "Нью-Йорк"},
@@ -143,10 +142,9 @@ def check_crypto_payment(invoice_id):
         logger.error(f"Ошибка проверки: {e}")
         return None
 
-# ============ ЮMONEY ФУНКЦИИ ============
+# ============ ЮMONEY ============
 
 def create_yoomoney_payment_url(amount, order_id):
-    """Создает ссылку для оплаты через ЮMoney"""
     return f"https://yoomoney.ru/quickpay/confirm.xml?receiver={YOOMONEY_WALLET}&quickpay-form=shop&targets=Оплата+заказа+{order_id}&paymentType=SB&sum={amount}&label={order_id}"
 
 # ============ ЗАГРУЗКА КЛЮЧЕЙ ============
@@ -311,16 +309,12 @@ def get_days_keyboard():
 def get_payment_keyboard(invoice_url, order_id, yoomoney_url):
     buttons = [
         [InlineKeyboardButton(
-            text="💰 Оплатить через ЮMoney (Рубли)",
+            text="💰 Оплатить через ЮMoney",
             url=yoomoney_url
         )],
         [InlineKeyboardButton(
-            text="💳 Оплатить через Cryptobot (USDT)",
+            text="💳 Оплатить через Cryptobot",
             url=invoice_url
-        )],
-        [InlineKeyboardButton(
-            text="💬 Написать @amniamov (ВРУЧНУЮ)",
-            url="https://t.me/amniamov"
         )],
         [InlineKeyboardButton(
             text="✅ Я оплатил",
@@ -376,7 +370,6 @@ async def cmd_start(message: Message):
 <b>💳 Способы оплаты:</b>
 • 💰 ЮMoney (рубли)
 • 💳 Cryptobot (USDT)
-• 💬 @amniamov (вручную)
 
 👇 <b>Выберите действие:</b>
 """
@@ -645,10 +638,6 @@ async def callback_how_to_pay(callback: CallbackQuery):
 • При заказе создается счет в USDT
 • Оплатите через Cryptobot
 
-<b>3️⃣ 💬 @amniamov (ВРУЧНУЮ)</b>
-• Напишите @amniamov
-• Укажите ваш ID: <code>{callback.from_user.id}</code>
-
 <b>⚠️ ВАЖНО!</b>
 При оплате ОБЯЗАТЕЛЬНО указывайте ваш Telegram ID!
 """
@@ -688,11 +677,8 @@ async def callback_support(callback: CallbackQuery):
 <b>❓ Сколько действуют ключи?</b>
 <i>Вы выбираете: 1д, 7д, 30д, 90д</i>
 
-<b>❓ Сколько устройств?</b>
-<i>1 ключ = 1 устройство</i>
-
 <b>❓ Как оплатить?</b>
-<i>ЮMoney, Cryptobot, или вручную через @amniamov</i>
+<i>ЮMoney или Cryptobot</i>
 """
     
     buttons = [
@@ -741,7 +727,6 @@ async def callback_back_to_main(callback: CallbackQuery, state: FSMContext):
 <b>💳 Способы оплаты:</b>
 • 💰 ЮMoney (рубли)
 • 💳 Cryptobot (USDT)
-• 💬 @amniamov (вручную)
 
 👇 <b>Выберите действие:</b>
 """
@@ -893,10 +878,8 @@ async def process_days(callback: CallbackQuery, state: FSMContext):
         payload = f"{callback.from_user.id}_{order_id}"
         description = f'VLESS ключ, {days_label} - {country_name}'
         
-        # Создаем счет в Cryptobot
         invoice = create_crypto_invoice(price_usd, payload, description)
         
-        # Создаем ссылку на ЮMoney
         yoomoney_url = create_yoomoney_payment_url(price_rub, order_id)
         
         if invoice:
@@ -929,7 +912,6 @@ async def process_days(callback: CallbackQuery, state: FSMContext):
                 user_messages[callback.from_user.id] = []
             user_messages[callback.from_user.id].append(msg.message_id)
         else:
-            # Если Cryptobot не работает — только ЮMoney
             text = f"""
 <b>✅ Ваш заказ</b>
 
@@ -974,11 +956,9 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
     price_rub = data.get('price_rub', 0)
     invoice_id = data.get('invoice_id')
     
-    # Проверяем оплату через Cryptobot
     if invoice_id:
         invoice = check_crypto_payment(invoice_id)
         if invoice and invoice.get('status') == 'paid':
-            # Оплата подтверждена - выдаем ключ автоматически
             keys = get_random_keys(country_code, 1)
             if keys:
                 key_text = f"""
@@ -1001,7 +981,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
                 await callback.answer()
                 return
     
-    # Сохраняем заказ для ручной проверки (ЮMoney или другая оплата)
     pending_payments[order_id] = {
         'user_id': user_id,
         'user_name': callback.from_user.first_name,
@@ -1037,7 +1016,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_keyboard()
     )
     
-    # Уведомление админу с ID оплаты
     admin_text = f"""
 🔔 <b>ПОСТУПИЛ НОВЫЙ ЗАКАЗ!</b>
 

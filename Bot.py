@@ -24,9 +24,6 @@ BOT_USERNAME = "vlesskeysfreebot"
 CRYPTOBOT_API_KEY = "615167:AAqHnExucpLHPuZsZFG02sdHC8O87hgl319"
 CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 
-# ============ ЮMONEY НАСТРОЙКИ ============
-YOOMONEY_WALLET = "4100119588989551"
-
 # Брендирование
 BOT_NAME = "🔥vlesskeysfreebot🔥"
 KEY_NAME = "🔥TG:vlesskeysfreebot🔥"
@@ -141,11 +138,6 @@ def check_crypto_payment(invoice_id):
     except Exception as e:
         logger.error(f"Ошибка проверки: {e}")
         return None
-
-# ============ ЮMONEY ============
-
-def create_yoomoney_payment_url(amount, order_id):
-    return f"https://yoomoney.ru/quickpay/confirm.xml?receiver={YOOMONEY_WALLET}&quickpay-form=shop&targets=Оплата+заказа+{order_id}&paymentType=SB&sum={amount}&label={order_id}"
 
 # ============ ЗАГРУЗКА КЛЮЧЕЙ ============
 
@@ -306,12 +298,8 @@ def get_days_keyboard():
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_countries")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_payment_keyboard(invoice_url, order_id, yoomoney_url):
+def get_payment_keyboard(invoice_url, order_id):
     buttons = [
-        [InlineKeyboardButton(
-            text="💰 Оплатить через ЮMoney",
-            url=yoomoney_url
-        )],
         [InlineKeyboardButton(
             text="💳 Оплатить через Cryptobot",
             url=invoice_url
@@ -367,9 +355,7 @@ async def cmd_start(message: Message):
 • 🌍 Доступно стран: {len(COUNTRIES)}
 • 🔥 Ежедневно более {DAILY_USERS} человек закупаются у нас
 
-<b>💳 Способы оплаты:</b>
-• 💰 ЮMoney (рубли)
-• 💳 Cryptobot (USDT)
+<b>💳 Оплата через Cryptobot (USDT)</b>
 
 👇 <b>Выберите действие:</b>
 """
@@ -406,10 +392,6 @@ async def cmd_admin(message: Message):
 • 7 дней = 25₽
 • 30 дней = 70₽
 • 90 дней = 180₽
-
-<b>💳 Способы оплаты:</b>
-• ЮMoney: {YOOMONEY_WALLET}
-• Cryptobot: активен
 
 <b>📋 Команды:</b>
 • /give &lt;user_id&gt; &lt;страна&gt; - Выдать ключ
@@ -627,16 +609,12 @@ async def callback_how_to_pay(callback: CallbackQuery):
         pass
     
     text = f"""
-<b>💳 Способы оплаты:</b>
+<b>💳 Оплата через Cryptobot</b>
 
-<b>1️⃣ 💰 ЮMoney (Рубли)</b>
-• Быстро, без комиссии
-• Кошелек: <code>{YOOMONEY_WALLET}</code>
-• Оплата через СБП или картой
-
-<b>2️⃣ 💳 Cryptobot (USDT)</b>
-• При заказе создается счет в USDT
-• Оплатите через Cryptobot
+1️⃣ При заказе создается счет в USDT
+2️⃣ Оплатите через Cryptobot
+3️⃣ Нажмите "✅ Я оплатил"
+4️⃣ Администратор проверит оплату и выдаст ключ
 
 <b>⚠️ ВАЖНО!</b>
 При оплате ОБЯЗАТЕЛЬНО указывайте ваш Telegram ID!
@@ -669,7 +647,7 @@ async def callback_support(callback: CallbackQuery):
 <b>❓ FAQ:</b>
 
 <b>❓ Как получить ключи?</b>
-<i>Оплатите и нажмите "✅ Я оплатил"</i>
+<i>Оплатите через Cryptobot и нажмите "✅ Я оплатил"</i>
 
 <b>❓ Сколько стоят ключи?</b>
 <i>От 5₽ до 180₽ в зависимости от срока</i>
@@ -678,7 +656,7 @@ async def callback_support(callback: CallbackQuery):
 <i>Вы выбираете: 1д, 7д, 30д, 90д</i>
 
 <b>❓ Как оплатить?</b>
-<i>ЮMoney или Cryptobot</i>
+<i>Cryptobot (USDT)</i>
 """
     
     buttons = [
@@ -724,9 +702,7 @@ async def callback_back_to_main(callback: CallbackQuery, state: FSMContext):
 • 🌍 Доступно стран: {len(COUNTRIES)}
 • 🔥 Ежедневно более {DAILY_USERS} человек закупаются у нас
 
-<b>💳 Способы оплаты:</b>
-• 💰 ЮMoney (рубли)
-• 💳 Cryptobot (USDT)
+<b>💳 Оплата через Cryptobot (USDT)</b>
 
 👇 <b>Выберите действие:</b>
 """
@@ -880,8 +856,6 @@ async def process_days(callback: CallbackQuery, state: FSMContext):
         
         invoice = create_crypto_invoice(price_usd, payload, description)
         
-        yoomoney_url = create_yoomoney_payment_url(price_rub, order_id)
-        
         if invoice:
             invoice_id = invoice.get('invoice_id')
             invoice_url = invoice.get('bot_invoice_url')
@@ -897,43 +871,25 @@ async def process_days(callback: CallbackQuery, state: FSMContext):
 💰 <b>Сумма:</b> {price_rub}₽ (${price_usd:.2f})
 🆔 <b>ID оплаты:</b> <code>{order_id}</code>
 
-<b>💳 Выберите способ оплаты:</b>
-• 💰 ЮMoney — мгновенно, без комиссии
-• 💳 Cryptobot — автоматическая проверка
+<b>💳 Нажмите кнопку для оплаты через Cryptobot!</b>
+<i>После оплаты нажмите "✅ Я оплатил"</i>
 """
             
             msg = await callback.message.answer(
                 text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_payment_keyboard(invoice_url, order_id, yoomoney_url)
+                reply_markup=get_payment_keyboard(invoice_url, order_id)
             )
             
             if callback.from_user.id not in user_messages:
                 user_messages[callback.from_user.id] = []
             user_messages[callback.from_user.id].append(msg.message_id)
         else:
-            text = f"""
-<b>✅ Ваш заказ</b>
-
-🌍 <b>Страна:</b> {country_name}
-⏰ <b>Срок:</b> {days_label}
-💰 <b>Сумма:</b> {price_rub}₽
-🆔 <b>ID оплаты:</b> <code>{order_id}</code>
-
-<b>💳 Оплатите через ЮMoney:</b>
-• Без комиссии
-• Мгновенно
-"""
-            
-            msg = await callback.message.answer(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=get_payment_keyboard(None, order_id, yoomoney_url)
+            await callback.message.answer(
+                "❌ Ошибка создания счета в Cryptobot.\n"
+                "Попробуйте позже или обратитесь в поддержку @amniamov",
+                reply_markup=get_main_keyboard()
             )
-            
-            if callback.from_user.id not in user_messages:
-                user_messages[callback.from_user.id] = []
-            user_messages[callback.from_user.id].append(msg.message_id)
         
         await callback.answer()
         
@@ -1009,8 +965,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
 
 ⏳ <b>Статус:</b> На проверке
 📞 Если возникли вопросы: @amniamov
-
-💡 Если оплачивали через ЮMoney — проверка займет 5-15 минут
 """,
         parse_mode=ParseMode.HTML,
         reply_markup=get_main_keyboard()
@@ -1027,8 +981,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
 💰 <b>Сумма:</b> {price_rub}₽
 🆔 <b>ID оплаты:</b> <code>{order_id}</code>
 🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-
-💳 <b>ЮMoney кошелек:</b> <code>{YOOMONEY_WALLET}</code>
 
 ⚠️ <b>Проверьте оплату и выдайте ключ!</b>
 """
@@ -1160,7 +1112,6 @@ async def main():
     print("🚀 Бот запущен!")
     print("👑 Админы:", ADMIN_IDS)
     print("💰 Цены: от 5₽")
-    print(f"💳 ЮMoney кошелек: {YOOMONEY_WALLET}")
     print("📡 Загрузка ключей...")
     
     keys = get_vless_keys_optimized()

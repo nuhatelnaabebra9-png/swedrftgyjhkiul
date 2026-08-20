@@ -6,7 +6,6 @@ import json
 import os
 import time
 import re
-import subprocess
 from datetime import datetime, timedelta
 from functools import wraps
 from aiogram import Bot, Dispatcher, types, F
@@ -16,12 +15,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from urllib3.exceptions import InsecureRequestWarning
-
-import urllib3
-urllib3.disable_warnings(InsecureRequestWarning)
 
 # ============ КОНФИГУРАЦИЯ ============
 
@@ -38,6 +31,18 @@ REQUIRED_CHANNELS = [
 # ============ CRYPTOBOT НАСТРОЙКИ ============
 CRYPTOBOT_API_KEY = "615167:AAqHnExucpLHPuZsZFG02sdHC8O87hgl319"
 CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
+
+# ============ ХРАНИЛИЩЕ ============
+verified_users = {}  # user_id: timestamp
+pending_users = {}  # user_id: {"username": ..., "first_name": ..., "timestamp": ...}
+orders = {}
+pending_payments = {}
+used_keys = {}
+regular_keys_cache = {}
+last_update = None
+user_messages = {}
+free_keys_used = {}
+loading_in_progress = False
 
 # ============ НАСТРОЙКИ ============
 MIN_KEYS_PER_COUNTRY = 500
@@ -69,14 +74,6 @@ COUNTRIES = [
 ]
 
 DAILY_USERS = "50+"
-orders = {}
-pending_payments = {}
-used_keys = {}
-regular_keys_cache = {}
-last_update = None
-user_messages = {}
-free_keys_used = {}
-loading_in_progress = False
 
 # ============ КЛАСС ДЛЯ ПРОВЕРКИ КЛЮЧЕЙ ============
 
@@ -299,48 +296,27 @@ def get_total_keys_count():
     keys = get_vless_keys_optimized()
     return sum(len(v) for v in keys.values()) if keys else 0
 
-# ============ ФУНКЦИЯ ПРОВЕРКИ ПОДПИСКИ ============
+# ============ ЦЕНЫ ============
+PRICES = {
+    "1_day": 5,
+    "7_days": 25,
+    "30_days": 70,
+    "90_days": 180,
+}
 
-async def check_subscription(user_id: int) -> bool:
-    for channel in REQUIRED_CHANNELS:
-        try:
-            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except Exception as e:
-            logger.error(f"Ошибка проверки подписки для {channel}: {e}")
-            return False
-    return True
+DAYS_MAP = {
+    "1": "1_day",
+    "7": "7_days",
+    "30": "30_days",
+    "90": "90_days",
+}
 
-def require_subscription():
-    def decorator(handler):
-        @wraps(handler)
-        async def wrapper(message: Message, *args, **kwargs):
-            user_id = message.from_user.id
-            is_subscribed = await check_subscription(user_id)
-            if not is_subscribed:
-                channels_buttons = []
-                for channel in REQUIRED_CHANNELS:
-                    channels_buttons.append([
-                        InlineKeyboardButton(
-                            text=f"📢 Подписаться на канал",
-                            url=channel
-                        )
-                    ])
-                channels_buttons.append([
-                    InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")
-                ])
-                keyboard = InlineKeyboardMarkup(inline_keyboard=channels_buttons)
-                await message.answer(
-                    "⚠️ <b>Для использования бота необходимо подписаться на наши каналы!</b>\n\n"
-                    "Это бесплатно и займет всего пару секунд.👇",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard
-                )
-                return
-            return await handler(message, *args, **kwargs)
-        return wrapper
-    return decorator
+def get_price_rub(days):
+    return PRICES.get(days, 0)
+
+def get_price_usd(days):
+    rub = get_price_rub(days)
+    return round(rub / 83, 2)
 
 # ============ КЛАВИАТУРЫ ============
 
@@ -351,6 +327,24 @@ def get_main_keyboard():
         [InlineKeyboardButton(text="🌍 Список стран", callback_data="countries")],
         [InlineKeyboardButton(text="💳 Как оплатить?", callback_data="how_to_pay")],
         [InlineKeyboardButton(text="📞 Поддержка", callback_data="support")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_subscription_keyboard():
+    buttons = []
+    for channel in REQUIRED_CHANNELS:
+        buttons.append([
+            InlineKeyboardButton(text="📢 Подписаться на канал", url=channel)
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="✅ Я подписался", callback_data="sub_confirm")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_admin_keyboard(user_id):
+    buttons = [
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{user_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -398,27 +392,30 @@ def get_payment_keyboard(invoice_url, order_id):
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_admin_keyboard(order_id, user_id):
+def get_admin_payment_keyboard(order_id, user_id):
     buttons = [
         [InlineKeyboardButton(
             text="✅ Выдать ключ",
-            callback_data=f"approve_{order_id}_{user_id}"
+            callback_data=f"approve_payment_{order_id}_{user_id}"
         )],
         [InlineKeyboardButton(
             text="❌ Отклонить",
-            callback_data=f"reject_{order_id}_{user_id}"
+            callback_data=f"reject_payment_{order_id}_{user_id}"
         )]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# ============ ОБРАБОТЧИКИ КОМАНД ============
+# ============ КОМАНДЫ ============
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    user_id = message.from_user.id
     user_name = message.from_user.first_name
-    total = get_total_keys_count()
     
-    text = f"""
+    # Если уже подтвержден — показываем главное меню
+    if user_id in verified_users:
+        total = get_total_keys_count()
+        text = f"""
 🌟 <b>Добро пожаловать, {user_name}!</b>
 
 <i>Ваш надежный поставщик VLESS ключей</i>
@@ -435,191 +432,239 @@ async def cmd_start(message: Message):
 
 <b>📊 Статистика:</b>
 • 📦 Всего ключей: {total}
-• 🌍 Доступно стран: {len(COUNTRIES)}
-• 🔥 Ежедневно более {DAILY_USERS} человек закупаются у нас
+• 🌍 Доступно стран: 8
+• 🔥 Ежедневно более 50+ человек закупаются у нас
 
 <b>💳 Оплата через Cryptobot (USDT)</b>
 
 👇 <b>Выберите действие:</b>
 """
-    
-    msg = await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-    if message.from_user.id not in user_messages:
-        user_messages[message.from_user.id] = []
-    user_messages[message.from_user.id].append(msg.message_id)
-
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет доступа.")
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
         return
     
-    total = get_total_keys_count()
+    # Если заявка уже отправлена
+    if user_id in pending_users:
+        await message.answer(
+            "⏳ <b>Ваша заявка уже отправлена на проверку!</b>\n\n"
+            "Администратор проверит вашу подписку в ближайшее время.\n"
+            "Это займет не более 5 минут.\n\n"
+            "📞 Если возникли вопросы: @amniamov",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Показываем требование подписки
     text = f"""
-<b>👑 Панель администратора</b>
+🌟 <b>Добро пожаловать, {user_name}!</b>
+
+⚠️ <b>Для использования бота необходимо подписаться на наши каналы!</b>
+
+Это бесплатно и займет всего пару секунд.👇
+
+📢 <b>Каналы:</b>
+• {REQUIRED_CHANNELS[0]}
+• {REQUIRED_CHANNELS[1]}
+
+<i>После подписки нажмите кнопку "✅ Я подписался"</i>
+"""
+    
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_subscription_keyboard())
+
+@dp.callback_query(F.data == "sub_confirm")
+async def subscription_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_name = callback.from_user.first_name
+    username = callback.from_user.username or "не указан"
+    
+    if user_id in verified_users:
+        await callback.answer("✅ Вы уже подтверждены!", show_alert=True)
+        return
+    
+    if user_id in pending_users:
+        await callback.answer("⏳ Ваша заявка уже на проверке!", show_alert=True)
+        return
+    
+    pending_users[user_id] = {
+        "first_name": user_name,
+        "username": username,
+        "timestamp": datetime.now().strftime('%d.%m.%Y %H:%M')
+    }
+    
+    await callback.message.edit_text(
+        "⏳ <b>Проверяем подписку...</b>\n\n"
+        "✅ Ваша заявка отправлена на проверку администратору!\n\n"
+        "Подождите, администратор проверит вашу подписку.\n"
+        "Это займет не более 5 минут.\n\n"
+        "📞 Если возникли вопросы: @amniamov",
+        parse_mode=ParseMode.HTML,
+        reply_markup=None
+    )
+    
+    admin_text = f"""
+🔔 <b>НОВАЯ ЗАЯВКА НА ПОДПИСКУ!</b>
+
+👤 <b>Пользователь:</b> {user_name}
+🆔 <b>ID:</b> <code>{user_id}</code>
+👤 <b>Username:</b> @{username}
+🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
+
+📢 <b>Проверьте подписку на каналы:</b>
+• {REQUIRED_CHANNELS[0]}
+• {REQUIRED_CHANNELS[1]}
+"""
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                admin_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_admin_keyboard(user_id)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки админу: {e}")
+    
+    await callback.answer("✅ Заявка отправлена на проверку!")
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def approve_user(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[1])
+    
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Только для админа!", show_alert=True)
+        return
+    
+    if user_id not in pending_users:
+        await callback.answer("❌ Заявка не найдена", show_alert=True)
+        return
+    
+    verified_users[user_id] = datetime.now()
+    user_data = pending_users.pop(user_id)
+    
+    await callback.message.edit_text(
+        f"✅ <b>Пользователь одобрен!</b>\n\n"
+        f"👤 {user_data['first_name']}\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"👤 @{user_data['username']}\n"
+        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=None
+    )
+    
+    try:
+        await bot.send_message(
+            user_id,
+            "✅ <b>Подписка подтверждена!</b>\n\n"
+            "Доступ к боту открыт.\n"
+            "Можете пользоваться всеми функциями.\n\n"
+            "🌟 <b>Добро пожаловать!</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        total = get_total_keys_count()
+        text = f"""
+🌟 <b>Добро пожаловать!</b>
+
+<i>Ваш надежный поставщик VLESS ключей</i>
+
+<b>📌 Что мы предлагаем:</b>
+• 🔑 Качественные VLESS ключи 
+• 🌍 Сервера в 8 странах
+• ⏰ Гибкие сроки: 1д, 7д, 30д, 90д
+
+<b>🎁 Пробный период:</b>
+• <b>Бесплатный ключ</b> на 1 день (1 раз)
+• Доступ ко всем странам
+• Без ограничений
 
 <b>📊 Статистика:</b>
-• Всего ключей: {total}
-• Использовано: {sum(len(v) for v in used_keys.values())}
-• В обработке: {len(pending_payments)}
+• 📦 Всего ключей: {total}
+• 🌍 Доступно стран: 8
+• 🔥 Ежедневно более 50+ человек закупаются у нас
 
-<b>🌍 Ключи по странам:</b>
+<b>💳 Оплата через Cryptobot (USDT)</b>
+
+👇 <b>Выберите действие:</b>
 """
-    for country in COUNTRIES:
-        count = get_keys_count(country['code'])
-        text += f"• {country['name']}: {count} ключей\n"
-
-    text += f"""
-<b>💰 Цены:</b>
-• 1 день = 5₽
-• 7 дней = 25₽
-• 30 дней = 70₽
-• 90 дней = 180₽
-
-<b>📋 Команды:</b>
-• /give &lt;user_id&gt; &lt;страна&gt; - Выдать ключ
-• /stats - Статистика
-• /refresh - Обновить ключи
-"""
-    await message.answer(text, parse_mode=ParseMode.HTML)
-
-@dp.message(Command("give"))
-async def cmd_give(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав.")
-        return
-    
-    args = message.text.split()
-    if len(args) < 3:
-        await message.answer(
-            "⚠️ <b>Использование:</b>\n\n"
-            "/give &lt;user_id&gt; &lt;страна&gt;\n\n"
-            "<b>Пример:</b>\n"
-            "/give 123456789 us",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    try:
-        target_user_id = int(args[1])
-        country_code = args[2]
+        await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
         
-        country = next((c for c in COUNTRIES if c['code'] == country_code), None)
-        if not country:
-            await message.answer(f"❌ Страна {country_code} не найдена")
-            return
-        
-        keys = get_random_keys(country_code, 1)
-        if not keys:
-            await message.answer(f"❌ Нет рабочих ключей для {country['name']}")
-            return
-        
-        key_text = f"""
-🔑 <b>Ваш рабочий VLESS ключ</b>
-
-<code>{keys[0]}</code>
-
-🌍 <b>Страна:</b> {country['name']}
-📅 <b>Выдан:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-✅ <b>Ключ проверен и работает</b>
-💣 <b>Бот:</b> {BOT_NAME}
-
-<b>📌 Инструкция:</b>
-1. Скачайте V2Ray клиент
-2. Импортируйте ключ
-3. Подключитесь
-
-<i>Спасибо за покупку! 💖</i>
-"""
-        
-        await bot.send_message(target_user_id, key_text, parse_mode=ParseMode.HTML)
-        await message.answer(f"✅ Рабочий ключ отправлен пользователю {target_user_id}")
-        
-    except ValueError:
-        await message.answer("❌ Неверный формат ID")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка уведомления пользователя: {e}")
+    
+    await callback.answer("✅ Пользователь одобрен!")
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав.")
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_user(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[1])
+    
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
-    total = get_total_keys_count()
-    used_total = sum(len(v) for v in used_keys.values())
-    
-    text = f"""
-<b>📊 СТАТИСТИКА БОТА</b>
-
-<b>🔑 Ключи:</b>
-• Всего: {total}
-• Использовано: {used_total}
-• Доступно: {total - used_total}
-
-<b>🌍 Ключи по странам:</b>
-"""
-    
-    for country in COUNTRIES:
-        count = get_keys_count(country['code'])
-        text += f"• {country['name']}: {count} ключей\n"
-    
-    await message.answer(text, parse_mode=ParseMode.HTML)
-
-@dp.message(Command("refresh"))
-async def cmd_refresh(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав.")
+    if user_id not in pending_users:
+        await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
     
-    msg = await message.answer("🔄 Обновление ключей... ⏳")
+    user_data = pending_users.pop(user_id)
     
-    global regular_keys_cache, last_update
-    regular_keys_cache = None
-    last_update = None
-    
-    try:
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-    except:
-        pass
-    
-    keys = get_vless_keys_optimized()
-    total = sum(len(v) for v in keys.values()) if keys else 0
+    await callback.message.edit_text(
+        f"❌ <b>Пользователь отклонен!</b>\n\n"
+        f"👤 {user_data['first_name']}\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"👤 @{user_data['username']}\n"
+        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=None
+    )
     
     try:
-        await msg.delete()
-    except:
-        pass
-    
-    if keys:
-        await message.answer(f"✅ Ключи обновлены! Всего ключей: {total}")
-    else:
-        await message.answer("❌ Ошибка обновления ключей")
-
-@dp.callback_query(F.data == "check_sub")
-async def check_subscription_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    is_subscribed = await check_subscription(user_id)
-    if is_subscribed:
-        await callback.message.edit_text(
-            "✅ <b>Подписка подтверждена!</b>\n"
-            "Теперь вы можете пользоваться ботом.",
+        await bot.send_message(
+            user_id,
+            "❌ <b>Ваша заявка на подписку отклонена</b>\n\n"
+            "Возможные причины:\n"
+            "• Вы не подписались на все каналы\n"
+            "• Подписка не подтверждена\n\n"
+            "Пожалуйста, подпишитесь на каналы и попробуйте снова.\n\n"
+            "📢 <b>Каналы:</b>\n"
+            f"• {REQUIRED_CHANNELS[0]}\n"
+            f"• {REQUIRED_CHANNELS[1]}",
             parse_mode=ParseMode.HTML
         )
-        await callback.answer("Доступ открыт!")
-    else:
-        await callback.answer(
-            "❌ Вы еще не подписаны на все каналы.\n"
-            "Пожалуйста, подпишитесь и нажмите кнопку снова.",
-            show_alert=True
-        )
+        
+        text = f"""
+⚠️ <b>Для использования бота необходимо подписаться на наши каналы!</b>
 
-# ============ CALLBACK ОБРАБОТЧИКИ ============
+Это бесплатно и займет всего пару секунд.👇
+
+📢 <b>Каналы:</b>
+• {REQUIRED_CHANNELS[0]}
+• {REQUIRED_CHANNELS[1]}
+
+<i>После подписки нажмите кнопку "✅ Я подписался"</i>
+"""
+        await bot.send_message(
+            user_id,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_subscription_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка уведомления пользователя: {e}")
+    
+    await callback.answer("❌ Пользователь отклонен!")
+
+# ============ CALLBACK ОБРАБОТЧИКИ ПОКУПКИ ============
 
 @dp.callback_query(F.data == "buy")
-@require_subscription()
 async def callback_buy(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    # Проверяем подписку
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
     try:
         await callback.message.delete()
     except:
@@ -638,9 +683,13 @@ async def callback_buy(callback: CallbackQuery, state: FSMContext):
     user_messages[callback.from_user.id].append(msg.message_id)
 
 @dp.callback_query(F.data == "free_key")
-@require_subscription()
 async def callback_free_key(callback: CallbackQuery):
     user_id = callback.from_user.id
+    
+    # Проверяем подписку
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
     
     if user_id in free_keys_used:
         await callback.answer("❌ Вы уже использовали бесплатный ключ!", show_alert=True)
@@ -671,8 +720,13 @@ async def callback_free_key(callback: CallbackQuery):
     await callback.answer("🎁 Бесплатный рабочий ключ выдан!")
 
 @dp.callback_query(F.data == "countries")
-@require_subscription()
 async def callback_countries(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
     try:
         await callback.message.delete()
     except:
@@ -708,8 +762,13 @@ async def callback_countries(callback: CallbackQuery):
     user_messages[callback.from_user.id].append(msg.message_id)
 
 @dp.callback_query(F.data == "how_to_pay")
-@require_subscription()
 async def callback_how_to_pay(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
     try:
         await callback.message.delete()
     except:
@@ -739,8 +798,13 @@ async def callback_how_to_pay(callback: CallbackQuery):
     user_messages[callback.from_user.id].append(msg.message_id)
 
 @dp.callback_query(F.data == "support")
-@require_subscription()
 async def callback_support(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
     try:
         await callback.message.delete()
     except:
@@ -879,8 +943,13 @@ async def back_to_countries(callback: CallbackQuery, state: FSMContext):
     user_messages[callback.from_user.id].append(msg.message_id)
 
 @dp.callback_query(F.data.startswith("country_"))
-@require_subscription()
 async def process_country(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
     try:
         country_code = callback.data.split("_")[1]
         country = next((c for c in COUNTRIES if c['code'] == country_code), None)
@@ -923,8 +992,13 @@ async def process_country(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
 
 @dp.callback_query(F.data.startswith("days_"))
-@require_subscription()
 async def process_days(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
     try:
         days_num = int(callback.data.split("_")[1])
         
@@ -1014,10 +1088,14 @@ async def process_days(callback: CallbackQuery, state: FSMContext):
 # ============ ПОЛЬЗОВАТЕЛЬ НАЖАЛ "Я ОПЛАТИЛ" ============
 
 @dp.callback_query(F.data.startswith("paid_"))
-@require_subscription()
 async def process_paid(callback: CallbackQuery, state: FSMContext):
-    order_id = callback.data.split("_")[1]
     user_id = callback.from_user.id
+    
+    if user_id not in verified_users:
+        await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
+        return
+    
+    order_id = callback.data.split("_")[1]
     
     data = await state.get_data()
     country_name = data.get('country_name', 'неизвестно')
@@ -1106,19 +1184,19 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
                 admin_id,
                 admin_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_admin_keyboard(order_id, user_id)
+                reply_markup=get_admin_payment_keyboard(order_id, user_id)
             )
         except Exception as e:
             logger.error(f"Ошибка отправки админу: {e}")
     
     await callback.answer("✅ Заказ отправлен на проверку!")
 
-# ============ АДМИНСКИЕ ОБРАБОТЧИКИ ============
+# ============ АДМИНСКИЕ ОБРАБОТЧИКИ ОПЛАТЫ ============
 
-@dp.callback_query(F.data.startswith("approve_"))
-async def approve_order(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("approve_payment_"))
+async def approve_payment(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("⛔ Только для админа!")
+        await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
     _, order_id, user_id = callback.data.split("_")
@@ -1178,10 +1256,10 @@ async def approve_order(callback: CallbackQuery):
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         await callback.answer()
 
-@dp.callback_query(F.data.startswith("reject_"))
-async def reject_order(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("reject_payment_"))
+async def reject_payment(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("⛔ Только для админа!")
+        await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
     _, order_id, user_id = callback.data.split("_")
@@ -1222,18 +1300,167 @@ async def reject_order(callback: CallbackQuery):
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         await callback.answer()
 
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет доступа.")
+        return
+    
+    total = get_total_keys_count()
+    text = f"""
+<b>👑 Панель администратора</b>
+
+<b>📊 Статистика:</b>
+• Всего ключей: {total}
+• Использовано: {sum(len(v) for v in used_keys.values())}
+• Ожидают подписку: {len(pending_users)}
+• Ожидают оплату: {len(pending_payments)}
+• Подтверждено: {len(verified_users)}
+
+<b>🌍 Ключи по странам:</b>
+"""
+    for country in COUNTRIES:
+        count = get_keys_count(country['code'])
+        text += f"• {country['name']}: {count} ключей\n"
+
+    text += f"""
+<b>💰 Цены:</b>
+• 1 день = 5₽
+• 7 дней = 25₽
+• 30 дней = 70₽
+• 90 дней = 180₽
+
+<b>📋 Команды:</b>
+• /give &lt;user_id&gt; &lt;страна&gt; - Выдать ключ
+• /stats - Статистика
+• /refresh - Обновить ключи
+"""
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+@dp.message(Command("give"))
+async def cmd_give(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer(
+            "⚠️ <b>Использование:</b>\n\n"
+            "/give &lt;user_id&gt; &lt;страна&gt;\n\n"
+            "<b>Пример:</b>\n"
+            "/give 123456789 us",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    try:
+        target_user_id = int(args[1])
+        country_code = args[2]
+        
+        country = next((c for c in COUNTRIES if c['code'] == country_code), None)
+        if not country:
+            await message.answer(f"❌ Страна {country_code} не найдена")
+            return
+        
+        keys = get_random_keys(country_code, 1)
+        if not keys:
+            await message.answer(f"❌ Нет рабочих ключей для {country['name']}")
+            return
+        
+        key_text = f"""
+🔑 <b>Ваш рабочий VLESS ключ</b>
+
+<code>{keys[0]}</code>
+
+🌍 <b>Страна:</b> {country['name']}
+📅 <b>Выдан:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
+✅ <b>Ключ проверен и работает</b>
+💣 <b>Бот:</b> {BOT_NAME}
+
+<b>📌 Инструкция:</b>
+1. Скачайте V2Ray клиент
+2. Импортируйте ключ
+3. Подключитесь
+
+<i>Спасибо за покупку! 💖</i>
+"""
+        
+        await bot.send_message(target_user_id, key_text, parse_mode=ParseMode.HTML)
+        await message.answer(f"✅ Рабочий ключ отправлен пользователю {target_user_id}")
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат ID")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    total = get_total_keys_count()
+    used_total = sum(len(v) for v in used_keys.values())
+    
+    text = f"""
+<b>📊 СТАТИСТИКА БОТА</b>
+
+<b>🔑 Ключи:</b>
+• Всего: {total}
+• Использовано: {used_total}
+• Доступно: {total - used_total}
+
+<b>👥 Пользователи:</b>
+• Подтверждено: {len(verified_users)}
+• Ожидают подписку: {len(pending_users)}
+
+<b>🌍 Ключи по странам:</b>
+"""
+    
+    for country in COUNTRIES:
+        count = get_keys_count(country['code'])
+        text += f"• {country['name']}: {count} ключей\n"
+    
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+@dp.message(Command("refresh"))
+async def cmd_refresh(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    msg = await message.answer("🔄 Обновление ключей... ⏳")
+    
+    global regular_keys_cache, last_update
+    regular_keys_cache = None
+    last_update = None
+    
+    try:
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+    except:
+        pass
+    
+    keys = get_vless_keys_optimized()
+    total = sum(len(v) for v in keys.values()) if keys else 0
+    
+    try:
+        await msg.delete()
+    except:
+        pass
+    
+    if keys:
+        await message.answer(f"✅ Ключи обновлены! Всего ключей: {total}")
+    else:
+        await message.answer("❌ Ошибка обновления ключей")
+
 # ============ ЗАПУСК ============
 
 async def main():
     print("🚀 Бот запущен!")
     print("👑 Админы:", ADMIN_IDS)
-    print("💰 Цены: от 5₽")
-    print("📡 Загрузка ключей...")
-    
-    keys = get_vless_keys_optimized()
-    total = sum(len(v) for v in keys.values()) if keys else 0
-    print(f"✅ Загружено {total} ключей")
-    
+    print("📢 Каналы:", REQUIRED_CHANNELS)
     print("-" * 40)
     
     try:

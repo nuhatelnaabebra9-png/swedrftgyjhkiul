@@ -260,10 +260,8 @@ def get_random_keys(country_code, quantity=1):
     available = get_keys_for_country(country_code)
     
     if not available:
-        logger.warning(f"⚠️ Нет ключей для страны {country_code}")
         return None
     
-    # Проверяем валидность ключей
     valid_keys = VlessKeyValidator.get_valid_keys(available, max_check=50)
     
     if not valid_keys:
@@ -426,6 +424,114 @@ async def check_subscription(user_id: int) -> bool:
             logger.error(f"Ошибка проверки подписки для {channel}: {e}")
             return False
     return True
+
+# ============ АДМИНСКАЯ РАССЫЛКА ============
+
+@dp.message(Command("bc"))
+async def cmd_broadcast(message: Message):
+    """Рассылку сообщения всем пользователям"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    # Получаем текст после команды
+    text = message.text.replace("/bc", "").strip()
+    
+    if not text:
+        await message.answer(
+            "⚠️ <b>Использование:</b>\n\n"
+            "/bc <текст сообщения>\n\n"
+            "<b>Пример:</b>\n"
+            "/bc Привет! У нас новые ключи!\n\n"
+            f"📊 <b>Получат:</b> {len(verified_users)} пользователей",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Подтверждение рассылки
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data=f"bc_confirm_{message.message_id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="bc_cancel")]
+    ])
+    
+    await message.answer(
+        f"📢 <b>Предпросмотр рассылки:</b>\n\n"
+        f"{text}\n\n"
+        f"👥 <b>Получат:</b> {len(verified_users)} пользователей\n"
+        f"⚠️ Отменить нельзя!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=confirm_keyboard
+    )
+
+@dp.callback_query(F.data.startswith("bc_confirm_"))
+async def bc_confirm(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Только для админа!", show_alert=True)
+        return
+    
+    # Получаем текст из сообщения
+    msg_text = callback.message.text
+    # Убираем предпросмотр и получаем только текст сообщения
+    lines = msg_text.split('\n')
+    broadcast_text = '\n'.join(lines[1:lines.index('👥 <b>Получат:</b>')]).strip()
+    
+    # Убираем HTML теги из текста для отправки
+    broadcast_text = broadcast_text.replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '')
+    
+    # Отправляем всем пользователям
+    sent = 0
+    failed = 0
+    
+    status_msg = await callback.message.edit_text(
+        "🔄 <b>Отправка рассылки...</b>\n\n"
+        f"👥 Всего: {len(verified_users)} пользователей",
+        parse_mode=ParseMode.HTML
+    )
+    
+    for user_id in verified_users.keys():
+        try:
+            await bot.send_message(
+                user_id,
+                f"📢 <b>Сообщение от администратора:</b>\n\n{broadcast_text}",
+                parse_mode=ParseMode.HTML
+            )
+            sent += 1
+            # Обновляем статус каждые 10 пользователей
+            if sent % 10 == 0:
+                await status_msg.edit_text(
+                    f"🔄 <b>Отправка рассылки...</b>\n\n"
+                    f"✅ Отправлено: {sent}\n"
+                    f"❌ Ошибок: {failed}\n"
+                    f"👥 Всего: {len(verified_users)}",
+                    parse_mode=ParseMode.HTML
+                )
+            # Небольшая задержка чтобы не флудить
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+    
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}\n"
+        f"👥 Всего: {len(verified_users)}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await callback.answer("✅ Рассылка выполнена!")
+
+@dp.callback_query(F.data == "bc_cancel")
+async def bc_cancel(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Только для админа!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "❌ <b>Рассылка отменена</b>",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("✅ Рассылка отменена")
 
 # ============ КОМАНДЫ ============
 
@@ -1115,7 +1221,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
     price_rub = data.get('price_rub', 0)
     invoice_id = data.get('invoice_id')
     
-    # Проверяем оплату через Cryptobot
     if invoice_id:
         invoice = check_crypto_payment(invoice_id)
         if invoice and invoice.get('status') == 'paid':
@@ -1142,7 +1247,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
                 await callback.answer()
                 return
     
-    # Сохраняем заказ для ручной проверки
     pending_payments[order_id] = {
         'user_id': user_id,
         'user_name': callback.from_user.first_name,
@@ -1176,7 +1280,6 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_keyboard()
     )
     
-    # Уведомление админу
     admin_text = f"""
 🔔 <b>ПОСТУПИЛ НОВЫЙ ЗАКАЗ!</b>
 
@@ -1205,7 +1308,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Заказ отправлен на проверку!")
 
-# ============ АДМИНСКАЯ ВЫДАЧА КЛЮЧЕЙ (ИСПРАВЛЕННАЯ) ============
+# ============ АДМИНСКАЯ ВЫДАЧА КЛЮЧЕЙ ============
 
 @dp.callback_query(F.data.startswith("approve_payment_"))
 async def approve_payment(callback: CallbackQuery):
@@ -1213,15 +1316,13 @@ async def approve_payment(callback: CallbackQuery):
         await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
-    # Парсим callback_data
     parts = callback.data.split("_")
-    # Формат: approve_payment_{order_id}_{user_id}
     if len(parts) < 3:
         await callback.message.edit_text("❌ Ошибка в данных заказа")
         await callback.answer()
         return
     
-    order_id = parts[2]  # order_id
+    order_id = parts[2]
     user_id = int(parts[3]) if len(parts) > 3 else None
     
     if user_id is None:
@@ -1229,7 +1330,6 @@ async def approve_payment(callback: CallbackQuery):
         await callback.answer()
         return
     
-    # Получаем заказ
     order = pending_payments.get(order_id)
     if not order:
         await callback.message.edit_text("❌ Заказ не найден или уже обработан.")
@@ -1243,7 +1343,6 @@ async def approve_payment(callback: CallbackQuery):
     days = order.get('days', 'неизвестно')
     price = order.get('price', 0)
     
-    # Получаем ключ
     keys = get_random_keys(country_code, 1)
     if not keys:
         await callback.message.edit_text(f"❌ Нет рабочих ключей для {country}\nПопробуйте /refresh")
@@ -1252,7 +1351,6 @@ async def approve_payment(callback: CallbackQuery):
     
     key = keys[0]
     
-    # Отправляем ключ пользователю
     key_text = f"""
 🔑 <b>Ваш рабочий VLESS ключ</b>
 
@@ -1272,7 +1370,6 @@ async def approve_payment(callback: CallbackQuery):
     try:
         await bot.send_message(user_id, key_text, parse_mode=ParseMode.HTML)
         
-        # Обновляем сообщение админа
         await callback.message.edit_text(
             f"✅ <b>Рабочий ключ выдан!</b>\n\n"
             f"👤 Пользователь: {order.get('user_name', 'Unknown')}\n"
@@ -1284,7 +1381,6 @@ async def approve_payment(callback: CallbackQuery):
             parse_mode=ParseMode.HTML
         )
         
-        # Удаляем заказ из ожидающих
         if order_id in pending_payments:
             del pending_payments[order_id]
         
@@ -1387,6 +1483,7 @@ async def cmd_admin(message: Message):
 • /give &lt;user_id&gt; &lt;страна&gt; - Выдать ключ
 • /stats - Статистика
 • /refresh - Обновить ключи
+• /bc &lt;текст&gt; - Рассылка всем
 """
     await message.answer(text, parse_mode=ParseMode.HTML)
 

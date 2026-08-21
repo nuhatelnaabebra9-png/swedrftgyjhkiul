@@ -34,14 +34,14 @@ CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 
 # ============ ХРАНИЛИЩЕ ============
 verified_users = {}  # user_id: timestamp
-pending_users = {}  # user_id: {"username": ..., "first_name": ..., "timestamp": ...}
+pending_users = {}  # user_id: user_data
 orders = {}
-pending_payments = {}
-used_keys = {}
-regular_keys_cache = {}
+pending_payments = {}  # order_id: order_data
+used_keys = {}  # country_code: [keys]
+regular_keys_cache = {}  # country_code: [keys]
 last_update = None
 user_messages = {}
-free_keys_used = {}
+free_keys_used = {}  # user_id: timestamp
 loading_in_progress = False
 
 # ============ НАСТРОЙКИ ============
@@ -109,7 +109,7 @@ class VlessKeyValidator:
         return True
     
     @classmethod
-    def get_valid_keys(cls, keys, max_check=20):
+    def get_valid_keys(cls, keys, max_check=50):
         valid_keys = []
         checked = 0
         for key in keys:
@@ -254,12 +254,16 @@ def get_keys_for_country(country_code):
 
 def get_random_keys(country_code, quantity=1):
     available = get_keys_for_country(country_code)
+    
     if not available:
         return None
     
+    # Проверяем валидность ключей
     valid_keys = VlessKeyValidator.get_valid_keys(available, max_check=50)
+    
     if not valid_keys:
-        return None
+        logger.warning(f"⚠️ Нет валидных ключей для {country_code}, берем первые 5")
+        valid_keys = available[:5]
     
     if len(valid_keys) < quantity:
         quantity = len(valid_keys)
@@ -270,7 +274,7 @@ def get_random_keys(country_code, quantity=1):
         used_keys[country_code] = []
     used_keys[country_code].extend(selected)
     
-    return [f"{k}" for k in selected]
+    return selected
 
 def get_random_key_any_country():
     countries = list(COUNTRIES)
@@ -285,7 +289,7 @@ def get_random_key_any_country():
                 if country['code'] not in used_keys:
                     used_keys[country['code']] = []
                 used_keys[country['code']].append(key)
-                return f"{key}", country['name']
+                return key, country['name']
     
     return None, None
 
@@ -341,10 +345,10 @@ def get_subscription_keyboard():
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_admin_keyboard(user_id):
+def get_admin_user_keyboard(user_id):
     buttons = [
-        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{user_id}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_user_{user_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_user_{user_id}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -405,6 +409,19 @@ def get_admin_payment_keyboard(order_id, user_id):
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+# ============ ФУНКЦИЯ ПРОВЕРКИ ПОДПИСКИ ============
+
+async def check_subscription(user_id: int) -> bool:
+    for channel in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception as e:
+            logger.error(f"Ошибка проверки подписки для {channel}: {e}")
+            return False
+    return True
+
 # ============ КОМАНДЫ ============
 
 @dp.message(Command("start"))
@@ -455,8 +472,11 @@ async def cmd_start(message: Message):
     
     # Показываем требование подписки
     text = f"""
+🌟 <b>Добро пожаловать, {user_name}!</b>
 
 ⚠️ <b>Для использования бота необходимо подписаться на наши каналы!</b>
+
+Это бесплатно и займет всего пару секунд.👇
 
 📢 <b>Каналы:</b>
 • {REQUIRED_CHANNELS[0]}
@@ -466,6 +486,8 @@ async def cmd_start(message: Message):
 """
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_subscription_keyboard())
+
+# ============ ОБРАБОТКА ПОДПИСКИ ============
 
 @dp.callback_query(F.data == "sub_confirm")
 async def subscription_confirm(callback: types.CallbackQuery):
@@ -497,6 +519,7 @@ async def subscription_confirm(callback: types.CallbackQuery):
         reply_markup=None
     )
     
+    # Уведомление админу
     admin_text = f"""
 🔔 <b>НОВАЯ ЗАЯВКА НА ПОДПИСКУ!</b>
 
@@ -516,16 +539,16 @@ async def subscription_confirm(callback: types.CallbackQuery):
                 admin_id,
                 admin_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_admin_keyboard(user_id)
+                reply_markup=get_admin_user_keyboard(user_id)
             )
         except Exception as e:
             logger.error(f"Ошибка отправки админу: {e}")
     
     await callback.answer("✅ Заявка отправлена на проверку!")
 
-@dp.callback_query(F.data.startswith("approve_"))
+@dp.callback_query(F.data.startswith("approve_user_"))
 async def approve_user(callback: types.CallbackQuery):
-    user_id = int(callback.data.split("_")[1])
+    user_id = int(callback.data.split("_")[2])
     
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Только для админа!", show_alert=True)
@@ -553,8 +576,7 @@ async def approve_user(callback: types.CallbackQuery):
             user_id,
             "✅ <b>Подписка подтверждена!</b>\n\n"
             "Доступ к боту открыт.\n"
-            "Можете пользоваться всеми функциями.\n\n"
-            "🌟 <b>Добро пожаловать!</b>",
+            "Можете пользоваться всеми функциями.",
             parse_mode=ParseMode.HTML
         )
         
@@ -590,9 +612,9 @@ async def approve_user(callback: types.CallbackQuery):
     
     await callback.answer("✅ Пользователь одобрен!")
 
-@dp.callback_query(F.data.startswith("reject_"))
+@dp.callback_query(F.data.startswith("reject_user_"))
 async def reject_user(callback: types.CallbackQuery):
-    user_id = int(callback.data.split("_")[1])
+    user_id = int(callback.data.split("_")[2])
     
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Только для админа!", show_alert=True)
@@ -621,23 +643,18 @@ async def reject_user(callback: types.CallbackQuery):
             "Возможные причины:\n"
             "• Вы не подписались на все каналы\n"
             "• Подписка не подтверждена\n\n"
-            "Пожалуйста, подпишитесь на каналы и попробуйте снова.\n\n"
-            "📢 <b>Каналы:</b>\n"
-            f"• {REQUIRED_CHANNELS[0]}\n"
-            f"• {REQUIRED_CHANNELS[1]}",
+            "Пожалуйста, подпишитесь на каналы и попробуйте снова.",
             parse_mode=ParseMode.HTML
         )
         
         text = f"""
 ⚠️ <b>Для использования бота необходимо подписаться на наши каналы!</b>
 
-Это бесплатно и займет всего пару секунд.👇
-
 📢 <b>Каналы:</b>
 • {REQUIRED_CHANNELS[0]}
 • {REQUIRED_CHANNELS[1]}
 
-<i>После подписки нажмите кнопку "✅ Я подписался"</i>
+<i>После подписки нажмите "✅ Я подписался"</i>
 """
         await bot.send_message(
             user_id,
@@ -657,7 +674,6 @@ async def reject_user(callback: types.CallbackQuery):
 async def callback_buy(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     
-    # Проверяем подписку
     if user_id not in verified_users:
         await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
         return
@@ -683,7 +699,6 @@ async def callback_buy(callback: CallbackQuery, state: FSMContext):
 async def callback_free_key(callback: CallbackQuery):
     user_id = callback.from_user.id
     
-    # Проверяем подписку
     if user_id not in verified_users:
         await callback.answer("⚠️ Сначала подпишитесь на каналы!", show_alert=True)
         return
@@ -1101,6 +1116,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
     price_rub = data.get('price_rub', 0)
     invoice_id = data.get('invoice_id')
     
+    # Проверяем оплату через Cryptobot
     if invoice_id:
         invoice = check_crypto_payment(invoice_id)
         if invoice and invoice.get('status') == 'paid':
@@ -1127,6 +1143,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
                 await callback.answer()
                 return
     
+    # Сохраняем заказ для ручной проверки
     pending_payments[order_id] = {
         'user_id': user_id,
         'user_name': callback.from_user.first_name,
@@ -1160,6 +1177,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_keyboard()
     )
     
+    # Уведомление админу
     admin_text = f"""
 🔔 <b>ПОСТУПИЛ НОВЫЙ ЗАКАЗ!</b>
 
@@ -1172,7 +1190,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
 🆔 <b>ID оплаты:</b> <code>{order_id}</code>
 🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
 
-⚠️ <b>Проверьте оплату и выдайте рабочий ключ!</b>
+⚠️ <b>Проверьте оплату и выдайте ключ!</b>
 """
     
     for admin_id in ADMIN_IDS:
@@ -1188,7 +1206,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Заказ отправлен на проверку!")
 
-# ============ АДМИНСКИЕ ОБРАБОТЧИКИ ОПЛАТЫ ============
+# ============ АДМИНСКАЯ ВЫДАЧА КЛЮЧЕЙ ============
 
 @dp.callback_query(F.data.startswith("approve_payment_"))
 async def approve_payment(callback: CallbackQuery):
@@ -1196,9 +1214,21 @@ async def approve_payment(callback: CallbackQuery):
         await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
-    _, order_id, user_id = callback.data.split("_")
-    user_id = int(user_id)
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.message.edit_text("❌ Ошибка в данных заказа")
+        await callback.answer()
+        return
     
+    order_id = parts[2]
+    user_id = int(parts[3]) if len(parts) > 3 else None
+    
+    if user_id is None:
+        await callback.message.edit_text("❌ Не найден ID пользователя")
+        await callback.answer()
+        return
+    
+    # Получаем заказ
     order = pending_payments.get(order_id)
     if not order:
         await callback.message.edit_text("❌ Заказ не найден или уже обработан.")
@@ -1210,16 +1240,20 @@ async def approve_payment(callback: CallbackQuery):
     days = order.get('days', 'неизвестно')
     price = order.get('price', 0)
     
+    # Получаем ключ
     keys = get_random_keys(country_code, 1)
     if not keys:
-        await callback.message.edit_text(f"❌ Нет рабочих ключей для {country}")
+        await callback.message.edit_text(f"❌ Нет рабочих ключей для {country}\nПопробуйте /refresh")
         await callback.answer()
         return
     
+    key = keys[0]
+    
+    # Отправляем ключ пользователю
     key_text = f"""
 🔑 <b>Ваш рабочий VLESS ключ</b>
 
-<code>{keys[0]}</code>
+<code>{key}</code>
 
 🌍 <b>Страна:</b> {country}
 ⏰ <b>Срок:</b> {days}
@@ -1235,6 +1269,7 @@ async def approve_payment(callback: CallbackQuery):
     try:
         await bot.send_message(user_id, key_text, parse_mode=ParseMode.HTML)
         
+        # Обновляем сообщение админа
         await callback.message.edit_text(
             f"✅ <b>Рабочий ключ выдан!</b>\n\n"
             f"👤 Пользователь: {order.get('user_name', 'Unknown')}\n"
@@ -1246,11 +1281,12 @@ async def approve_payment(callback: CallbackQuery):
             parse_mode=ParseMode.HTML
         )
         
+        # Удаляем заказ из ожидающих
         del pending_payments[order_id]
         await callback.answer("✅ Ключ выдан!")
         
     except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка: {e}")
+        await callback.message.edit_text(f"❌ Ошибка при выдаче ключа: {e}")
         await callback.answer()
 
 @dp.callback_query(F.data.startswith("reject_payment_"))
@@ -1259,8 +1295,19 @@ async def reject_payment(callback: CallbackQuery):
         await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
-    _, order_id, user_id = callback.data.split("_")
-    user_id = int(user_id)
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.message.edit_text("❌ Ошибка в данных заказа")
+        await callback.answer()
+        return
+    
+    order_id = parts[2]
+    user_id = int(parts[3]) if len(parts) > 3 else None
+    
+    if user_id is None:
+        await callback.message.edit_text("❌ Не найден ID пользователя")
+        await callback.answer()
+        return
     
     order = pending_payments.get(order_id)
     if not order:
@@ -1296,6 +1343,8 @@ async def reject_payment(callback: CallbackQuery):
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         await callback.answer()
+
+# ============ АДМИНСКИЕ КОМАНДЫ ============
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
@@ -1346,48 +1395,51 @@ async def cmd_give(message: Message):
             "⚠️ <b>Использование:</b>\n\n"
             "/give &lt;user_id&gt; &lt;страна&gt;\n\n"
             "<b>Пример:</b>\n"
-            "/give 123456789 us",
+            "/give 123456789 us\n\n"
+            "<b>Доступные страны:</b>\n"
+            "us - США, uk - Великобритания, de - Германия,\n"
+            "fr - Франция, nl - Нидерланды, jp - Япония,\n"
+            "sg - Сингапур, ru - Россия",
             parse_mode=ParseMode.HTML
         )
         return
     
     try:
         target_user_id = int(args[1])
-        country_code = args[2]
+        country_code = args[2].lower()
         
         country = next((c for c in COUNTRIES if c['code'] == country_code), None)
         if not country:
-            await message.answer(f"❌ Страна {country_code} не найдена")
+            await message.answer(f"❌ Страна {country_code} не найдена\n\nДоступные: us, uk, de, fr, nl, jp, sg, ru")
             return
         
         keys = get_random_keys(country_code, 1)
         if not keys:
-            await message.answer(f"❌ Нет рабочих ключей для {country['name']}")
+            await message.answer(f"❌ Нет ключей для {country['name']}\nПопробуйте /refresh")
             return
         
+        key = keys[0]
+        
         key_text = f"""
-🔑 <b>Ваш рабочий VLESS ключ</b>
+🔑 <b>Ваш VLESS ключ</b>
 
-<code>{keys[0]}</code>
+<code>{key}</code>
 
 🌍 <b>Страна:</b> {country['name']}
 📅 <b>Выдан:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-✅ <b>Ключ проверен и работает</b>
-💣 <b>Бот:</b> {BOT_NAME}
+✅ <b>Ключ проверен</b>
 
 <b>📌 Инструкция:</b>
 1. Скачайте V2Ray клиент
 2. Импортируйте ключ
 3. Подключитесь
-
-<i>Спасибо за покупку! 💖</i>
 """
         
         await bot.send_message(target_user_id, key_text, parse_mode=ParseMode.HTML)
-        await message.answer(f"✅ Рабочий ключ отправлен пользователю {target_user_id}")
+        await message.answer(f"✅ Ключ отправлен пользователю {target_user_id}\n🌍 Страна: {country['name']}")
         
     except ValueError:
-        await message.answer("❌ Неверный формат ID")
+        await message.answer("❌ Неверный формат ID пользователя")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
@@ -1397,27 +1449,20 @@ async def cmd_stats(message: Message):
         await message.answer("⛔ У вас нет прав.")
         return
     
-    total = get_total_keys_count()
-    used_total = sum(len(v) for v in used_keys.values())
-    
+    total = 0
     text = f"""
-<b>📊 СТАТИСТИКА БОТА</b>
-
-<b>🔑 Ключи:</b>
-• Всего: {total}
-• Использовано: {used_total}
-• Доступно: {total - used_total}
-
-<b>👥 Пользователи:</b>
-• Подтверждено: {len(verified_users)}
-• Ожидают подписку: {len(pending_users)}
+<b>📊 СТАТИСТИКА КЛЮЧЕЙ</b>
 
 <b>🌍 Ключи по странам:</b>
 """
     
     for country in COUNTRIES:
-        count = get_keys_count(country['code'])
+        keys = get_keys_for_country(country['code'])
+        count = len(keys)
+        total += count
         text += f"• {country['name']}: {count} ключей\n"
+    
+    text += f"\n<b>📦 Всего ключей:</b> {total}"
     
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -1458,6 +1503,12 @@ async def main():
     print("🚀 Бот запущен!")
     print("👑 Админы:", ADMIN_IDS)
     print("📢 Каналы:", REQUIRED_CHANNELS)
+    print("📡 Загрузка ключей...")
+    
+    keys = get_vless_keys_optimized()
+    total = sum(len(v) for v in keys.values()) if keys else 0
+    print(f"✅ Загружено {total} ключей")
+    
     print("-" * 40)
     
     try:

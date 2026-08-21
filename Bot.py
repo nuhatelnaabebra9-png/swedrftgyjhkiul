@@ -32,16 +32,20 @@ REQUIRED_CHANNELS = [
 CRYPTOBOT_API_KEY = "615167:AAqHnExucpLHPuZsZFG02sdHC8O87hgl319"
 CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 
+# Брендирование
+BOT_NAME = "🔥vlesskeysfreebot🔥"
+KEY_NAME = "🔥TG:vlesskeysfreebot🔥"
+
 # ============ ХРАНИЛИЩЕ ============
-verified_users = {}  # user_id: timestamp
-pending_users = {}  # user_id: user_data
+verified_users = {}
+pending_users = {}
 orders = {}
-pending_payments = {}  # order_id: order_data
-used_keys = {}  # country_code: [keys]
-regular_keys_cache = {}  # country_code: [keys]
+pending_payments = {}
+used_keys = {}
+regular_keys_cache = {}
 last_update = None
 user_messages = {}
-free_keys_used = {}  # user_id: timestamp
+free_keys_used = {}
 loading_in_progress = False
 
 # ============ НАСТРОЙКИ ============
@@ -256,6 +260,7 @@ def get_random_keys(country_code, quantity=1):
     available = get_keys_for_country(country_code)
     
     if not available:
+        logger.warning(f"⚠️ Нет ключей для страны {country_code}")
         return None
     
     # Проверяем валидность ключей
@@ -429,7 +434,6 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     user_name = message.from_user.first_name
     
-    # Если уже подтвержден — показываем главное меню
     if user_id in verified_users:
         total = get_total_keys_count()
         text = f"""
@@ -459,7 +463,6 @@ async def cmd_start(message: Message):
         await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
         return
     
-    # Если заявка уже отправлена
     if user_id in pending_users:
         await message.answer(
             "⏳ <b>Ваша заявка уже отправлена на проверку!</b>\n\n"
@@ -470,7 +473,6 @@ async def cmd_start(message: Message):
         )
         return
     
-    # Показываем требование подписки
     text = f"""
 🌟 <b>Добро пожаловать, {user_name}!</b>
 
@@ -486,8 +488,6 @@ async def cmd_start(message: Message):
 """
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_subscription_keyboard())
-
-# ============ ОБРАБОТКА ПОДПИСКИ ============
 
 @dp.callback_query(F.data == "sub_confirm")
 async def subscription_confirm(callback: types.CallbackQuery):
@@ -519,7 +519,6 @@ async def subscription_confirm(callback: types.CallbackQuery):
         reply_markup=None
     )
     
-    # Уведомление админу
     admin_text = f"""
 🔔 <b>НОВАЯ ЗАЯВКА НА ПОДПИСКУ!</b>
 
@@ -1206,7 +1205,7 @@ async def process_paid(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Заказ отправлен на проверку!")
 
-# ============ АДМИНСКАЯ ВЫДАЧА КЛЮЧЕЙ ============
+# ============ АДМИНСКАЯ ВЫДАЧА КЛЮЧЕЙ (ИСПРАВЛЕННАЯ) ============
 
 @dp.callback_query(F.data.startswith("approve_payment_"))
 async def approve_payment(callback: CallbackQuery):
@@ -1214,13 +1213,15 @@ async def approve_payment(callback: CallbackQuery):
         await callback.answer("⛔ Только для админа!", show_alert=True)
         return
     
+    # Парсим callback_data
     parts = callback.data.split("_")
+    # Формат: approve_payment_{order_id}_{user_id}
     if len(parts) < 3:
         await callback.message.edit_text("❌ Ошибка в данных заказа")
         await callback.answer()
         return
     
-    order_id = parts[2]
+    order_id = parts[2]  # order_id
     user_id = int(parts[3]) if len(parts) > 3 else None
     
     if user_id is None:
@@ -1234,6 +1235,8 @@ async def approve_payment(callback: CallbackQuery):
         await callback.message.edit_text("❌ Заказ не найден или уже обработан.")
         await callback.answer()
         return
+    
+    logger.info(f"📦 Выдача ключа для заказа {order_id}, пользователь {user_id}")
     
     country_code = order.get('country_code')
     country = order.get('country', 'неизвестно')
@@ -1282,10 +1285,13 @@ async def approve_payment(callback: CallbackQuery):
         )
         
         # Удаляем заказ из ожидающих
-        del pending_payments[order_id]
+        if order_id in pending_payments:
+            del pending_payments[order_id]
+        
         await callback.answer("✅ Ключ выдан!")
         
     except Exception as e:
+        logger.error(f"❌ Ошибка при выдаче ключа: {e}")
         await callback.message.edit_text(f"❌ Ошибка при выдаче ключа: {e}")
         await callback.answer()
 
@@ -1337,7 +1343,8 @@ async def reject_payment(callback: CallbackQuery):
             parse_mode=ParseMode.HTML
         )
         
-        del pending_payments[order_id]
+        if order_id in pending_payments:
+            del pending_payments[order_id]
         await callback.answer("❌ Заказ отклонен")
         
     except Exception as e:
